@@ -62,10 +62,16 @@ final class SSHClientInboundChannelHandler: Sendable {
     }
 }
 
+/// The connection was established, but key exchange and user authentication did not finish within `SSHClientSettings.loginTimeout`.
+public struct SSHLoginTimeoutError: Error {
+    public let timeout: TimeAmount
+}
+
 final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
     typealias InboundIn = Any
 
     private let promise: EventLoopPromise<Void>
+    private let loginTimeout: TimeAmount
     let logger = Logger(label: "nl.orlandos.citadel.handshake")
 
     /// A future that will be fulfilled when the handshake is complete.
@@ -74,11 +80,34 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
     }
 
     init(eventLoop: EventLoop, loginTimeout: TimeAmount) {
-        let promise = eventLoop.makePromise(of: Void.self)
-        self.promise = promise
+        self.promise = eventLoop.makePromise(of: Void.self)
+        self.loginTimeout = loginTimeout
+    }
 
+    func handlerAdded(context: ChannelHandlerContext) {
+        // Whoever awaits `authenticated` gets an error and never sees this channel again,
+        // so a failed handshake must not leave the TCP connection open behind it.
+        let channel = context.channel
+        promise.futureResult.whenFailure { _ in
+            channel.close(promise: nil)
+        }
+        // Handlers on a fresh channel are added before connect; the TCP connect has its own
+        // `connectTimeout`, so the login clock only starts once the channel is active.
+        if channel.isActive {
+            startLoginTimer(on: context.eventLoop)
+        }
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        startLoginTimer(on: context.eventLoop)
+        context.fireChannelActive()
+    }
+
+    private func startLoginTimer(on eventLoop: EventLoop) {
+        let promise = promise
+        let loginTimeout = loginTimeout
         eventLoop.scheduleTask(deadline: .now() + loginTimeout) {
-            promise.fail(ChannelError.connectTimeout(loginTimeout))
+            promise.fail(SSHLoginTimeoutError(timeout: loginTimeout))
         }
     }
 
@@ -108,6 +137,9 @@ public struct SSHClientSettings: Sendable {
     public var group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton
     internal var channelHandlers: [ChannelHandler & Sendable] = []
     public var connectTimeout: TimeAmount = .seconds(30)
+    /// Time allowed, once connected, for key exchange and user authentication. Some servers answer the first
+    /// authentication request only after a slow reverse DNS lookup of the client (sshd `UseDNS`).
+    public var loginTimeout: TimeAmount = .seconds(10)
 
     public init(
         host: String,
@@ -169,7 +201,7 @@ final class SSHClientSession: Sendable {
     ) -> EventLoopFuture<Void> {
         let handshakeHandler = ClientHandshakeHandler(
             eventLoop: channel.eventLoop,
-            loginTimeout: .seconds(10)
+            loginTimeout: settings.loginTimeout
         )
         var clientConfiguration = SSHClientConfiguration(
             userAuthDelegate: settings.authenticationMethod(),
